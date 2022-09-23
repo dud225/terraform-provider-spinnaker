@@ -1,119 +1,126 @@
 package provider
 
 import (
-	"context"
-	"fmt"
+  "context"
+  "io"
+  "reflect"
 
-	"github.com/hashicorp/terraform-plugin-framework/diag"
-	"github.com/hashicorp/terraform-plugin-framework/provider"
-	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
-	"github.com/hashicorp/terraform-plugin-framework/types"
+  "github.com/hashicorp/terraform-plugin-framework/datasource"
+  "github.com/hashicorp/terraform-plugin-framework/diag"
+  "github.com/hashicorp/terraform-plugin-framework/path"
+  "github.com/hashicorp/terraform-plugin-framework/provider"
+  "github.com/hashicorp/terraform-plugin-framework/resource"
+  "github.com/hashicorp/terraform-plugin-framework/tfsdk"
+  "github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+
+  "github.com/spinnaker/spin/cmd/gateclient"
+  "github.com/spinnaker/spin/cmd/output"
 )
 
-// Ensure provider defined types fully satisfy framework interfaces
-var _ provider.Provider = &scaffoldingProvider{}
+var _ provider.ProviderWithMetadata = (*spinnakerProvider)(nil)
 
-// provider satisfies the tfsdk.Provider interface and usually is included
-// with all Resource and DataSource implementations.
-type scaffoldingProvider struct {
-	// client can contain the upstream provider SDK or HTTP client used to
-	// communicate with the upstream service. Resource and DataSource
-	// implementations can then make calls using this client.
-	//
-	// TODO: If appropriate, implement upstream provider SDK or HTTP client.
-	// client vendorsdk.ExampleClient
-
-	// configured is set to true at the end of the Configure method.
-	// This can be used in Resource and DataSource implementations to verify
-	// that the provider was previously configured.
-	configured bool
-
-	// version is set to the provider version on release, "dev" when the
-	// provider is built and ran locally, and "test" when running acceptance
-	// testing.
-	version string
+type spinnakerProvider struct {
+  version string
 }
 
-// providerData can be used to store data from the Terraform configuration.
 type providerData struct {
-	Example types.String `tfsdk:"example"`
-}
-
-func (p *scaffoldingProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
-	var data providerData
-	diags := req.Config.Get(ctx, &data)
-	resp.Diagnostics.Append(diags...)
-
-	if resp.Diagnostics.HasError() {
-		return
-	}
-
-	// Configuration values are now available.
-	// if data.Example.Null { /* ... */ }
-
-	// If the upstream provider SDK or HTTP client requires configuration, such
-	// as authentication or logging, this is a great opportunity to do so.
-
-	p.configured = true
-}
-
-func (p *scaffoldingProvider) GetResources(ctx context.Context) (map[string]provider.ResourceType, diag.Diagnostics) {
-	return map[string]provider.ResourceType{
-		"scaffolding_example": exampleResourceType{},
-	}, nil
-}
-
-func (p *scaffoldingProvider) GetDataSources(ctx context.Context) (map[string]provider.DataSourceType, diag.Diagnostics) {
-	return map[string]provider.DataSourceType{
-		"scaffolding_example": exampleDataSourceType{},
-	}, nil
-}
-
-func (p *scaffoldingProvider) GetSchema(ctx context.Context) (tfsdk.Schema, diag.Diagnostics) {
-	return tfsdk.Schema{
-		Attributes: map[string]tfsdk.Attribute{
-			"example": {
-				MarkdownDescription: "Example provider attribute",
-				Optional:            true,
-				Type:                types.StringType,
-			},
-		},
-	}, nil
+  SpinConfig       types.String `tfsdk:"spin_config"`
+  IgnoreCertErrors types.Bool   `tfsdk:"ignore_cert_errors"`
+  DefaultHeaders   types.String `tfsdk:"default_headers"`
 }
 
 func New(version string) func() provider.Provider {
-	return func() provider.Provider {
-		return &scaffoldingProvider{
-			version: version,
-		}
-	}
+  return func() provider.Provider {
+    return &spinnakerProvider{
+      version: version,
+    }
+  }
 }
 
-// convertProviderType is a helper function for NewResource and NewDataSource
-// implementations to associate the concrete provider type. Alternatively,
-// this helper can be skipped and the provider type can be directly type
-// asserted (e.g. provider: in.(*scaffoldingProvider)), however using this can prevent
-// potential panics.
-func convertProviderType(in provider.Provider) (scaffoldingProvider, diag.Diagnostics) {
-	var diags diag.Diagnostics
+func (p *spinnakerProvider) Metadata(ctx context.Context, req provider.MetadataRequest, resp *provider.MetadataResponse) {
+  resp.TypeName = "spinnaker"
+  resp.Version = p.version
+}
 
-	p, ok := in.(*scaffoldingProvider)
+func (p *spinnakerProvider) GetSchema(ctx context.Context) (tfsdk.Schema, diag.Diagnostics) {
+  return tfsdk.Schema{
+    Description:         "Spinnaker provider configuration",
+    MarkdownDescription: "Spinnaker provider configuration",
+    Attributes: map[string]tfsdk.Attribute{
+      "spin_config": {
+        Description:         "Spinnaker CLI configuration file",
+        Optional:            true,
+        Type:                types.StringType,
+      },
+      "ignore_cert_errors": {
+        Description:         "Ignore certificate errors",
+        Optional:            true,
+        Type:                types.BoolType,
+      },
+      "default_headers": {
+        Description:         "Additional headers to add to every request. It shall be configured as a comma separated list (e.g. key1=value1,key2=value2)",
+        Optional:            true,
+        Type:                types.StringType,
+      },
+    },
+  }, nil
+}
 
-	if !ok {
-		diags.AddError(
-			"Unexpected Provider Instance Type",
-			fmt.Sprintf("While creating the data source or resource, an unexpected provider type (%T) was received. This is always a bug in the provider code and should be reported to the provider developers.", p),
-		)
-		return scaffoldingProvider{}, diags
-	}
+func (p *spinnakerProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
+  var config providerData
+  resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
+  if resp.Diagnostics.HasError() {
+    return
+  }
 
-	if p == nil {
-		diags.AddError(
-			"Unexpected Provider Instance Type",
-			"While creating the data source or resource, an unexpected empty provider instance was received. This is always a bug in the provider code and should be reported to the provider developers.",
-		)
-		return scaffoldingProvider{}, diags
-	}
+  v := reflect.ValueOf(config)
+  for i := 0; i < v.Type().NumField(); i++ {
+    if v.Field(i).FieldByName("Unknown").Bool() {
+			resp.Diagnostics.AddAttributeWarning(
+        path.Root(v.Type().Field(i).Tag.Get("tfsdk")),
+				"Got unknown value",
+				"Can't interpolate into provider block, ignoring attribute",
+			)
+    }
+  }
 
-	return *p, diags
+	tflog.Trace(ctx, "Creating a gate client", map[string]interface{}{
+		"DefaultHeaders": config.DefaultHeaders.Value,
+		"SpinConfig": config.SpinConfig.Value,
+		"IgnoreCertErrors": config.IgnoreCertErrors.Value,
+	})
+	client, err := newSpinClient(config.DefaultHeaders.Value, config.SpinConfig.Value, config.IgnoreCertErrors.Value)
+  if err != nil {
+    resp.Diagnostics.AddError(
+       "Error connecting to Spinnaker",
+       "Failed to connect to Spinnaker Gate: " + err.Error(),
+     )
+     return
+  }
+  
+  resp.DataSourceData = client
+  resp.ResourceData = client
+}
+
+func (p *spinnakerProvider) Resources(ctx context.Context) []func() resource.Resource {
+  return []func() resource.Resource{
+    newApplicationResource,
+    newProjectResource,
+    newPipelineResource,
+    newPipelineTemplateResource,
+  }
+}
+
+func (p *spinnakerProvider) DataSources(ctx context.Context) []func() datasource.DataSource {
+  return []func() datasource.DataSource{
+    newApplicationDataSource,
+    newProjectDataSource,
+    newPipelineDataSource,
+  }
+}
+
+func newSpinClient(defaultHeaders, spinConfig string, ignoreCertErrors bool) (*gateclient.GatewayClient, error) {
+  ui := output.NewUI(false, true, output.MarshalToJson, io.Discard, io.Discard)
+  return gateclient.NewGateClient(ui, "", defaultHeaders, spinConfig, ignoreCertErrors, false)
 }
